@@ -4,15 +4,41 @@
 
 See which files are uncommitted in your Git worktree and which open OpenCode session last recorded an edit to each file.
 
-- Click a session heading to collapse or reopen it. Groups start expanded.
-- Click a filename to open OpenCode’s full-screen **Uncommitted** diff viewer. The white `[A]`, `[M]`, and `[D]` badges are not links.
-- Files without a reliable match stay under **Unassigned**. A match identifies a recent recorded edit, not ownership of every line in the patch.
+## Install and update
 
-## Install
+The beta targets the **OpenCode 2.3.2 terminal UI**. OpenCode V1 and the Desktop GUI are not supported.
 
-Requires the OpenCode V2 terminal UI. The beta targets OpenCode **2.3.2**. OpenCode V1 and the Desktop GUI are not supported.
+Add the plugin to `~/.config/opencode/cli.json` (or `$XDG_CONFIG_HOME/opencode/cli.json` if set), not `opencode.jsonc`. Keep any existing `plugins` entries. Use only one of the installation methods below. If you already use a local copy of the original sidebar plugin, disable or remove it from plugin discovery first to avoid a duplicate sidebar section.
 
-Once the beta is published to npm, add it to the `plugins` list in your OpenCode `cli.json` (`~/.config/opencode/cli.json` by default). Keep any existing entries.
+### From GitHub (available now)
+
+**Install:** Clone the repository. No npm install or build is needed.
+
+```sh
+git clone https://github.com/timrichardson/sidebar-git-diff.git "$HOME/sidebar-git-diff"
+```
+
+Add the absolute path to your clone to `plugins` in `cli.json`. Replace the example path with your own.
+
+```json
+{
+  "plugins": ["/home/you/sidebar-git-diff"]
+}
+```
+
+Run `/reload` in OpenCode.
+
+**Update:** Pull the latest changes into the same clone. OpenCode does not pull GitHub changes for you.
+
+```sh
+git -C "$HOME/sidebar-git-diff" pull --ff-only
+```
+
+OpenCode watches the local plugin files and normally reloads them after the pull. If the sidebar does not refresh, run `/reload` in OpenCode.
+
+### From npm (after the first beta is published)
+
+**Install:** Add `sidebar-git-diff@beta` to `plugins` in `cli.json`. OpenCode downloads the package for you. Run `/reload` if the plugin does not appear after saving.
 
 ```json
 {
@@ -20,15 +46,24 @@ Once the beta is published to npm, add it to the `plugins` list in your OpenCode
 }
 ```
 
-To use the beta before it is on npm, clone this repository and use the absolute path to the clone instead:
+**Update:** The `beta` tag does not auto-update. Ask OpenCode to check for and install the newer beta:
 
-```json
-{
-  "plugins": ["/absolute/path/to/sidebar-git-diff"]
-}
+```sh
+opencode plugin update sidebar-git-diff@beta
 ```
 
-Use `/reload` in OpenCode. Open the session sidebar with the **Toggle sidebar** command if it is hidden. Remove any local copy of the original sidebar plugin from discovery before enabling this package, or both will render.
+After the update, open a fresh OpenCode terminal UI to load the new package. In OpenCode 2.3.2, `/reload` can leave the old package running in an open TUI. You do not need to restart the background service. See [OpenCode’s plugin update documentation](https://opencode.ai/docs/plugins#manage) for other version selectors.
+
+## Use the sidebar
+
+Open a session. If its sidebar is hidden, use the **Toggle sidebar** command.
+
+- Click a session heading to collapse or reopen it. Groups start expanded.
+- Click **Collapse all** or **Expand all** next to **Git changes** to update every listed session group. The same action is available in the command palette (`Ctrl+P` by default). **Unassigned** stays visible.
+- Click a filename to open OpenCode’s full-screen **Uncommitted** diff viewer. The white `[A]`, `[M]`, and `[D]` badges are not links.
+- Files without a reliable match stay under **Unassigned**. A match identifies a recent recorded edit, not ownership of every line in the patch.
+
+If the sidebar contents do not fit vertically, OpenCode adds a scrollbar. Use the mouse wheel over the sidebar or drag the scrollbar to see the rest of the list.
 
 ## Attribution and diff behavior
 

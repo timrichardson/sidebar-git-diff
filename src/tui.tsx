@@ -100,7 +100,7 @@ function Sidebar(props: {
   sessionID: string
   directory: string
   collapsedSessions: () => ReadonlySet<string>
-  toggleSession: (sessionID: string) => void
+  setSessionsCollapsed: (sessionIDs: readonly string[], collapsed: boolean) => void
 }) {
   const { client, data, theme, ui } = props.context
   const [files, setFiles] = createSignal<VcsFileStatus[]>([])
@@ -215,6 +215,26 @@ function Sidebar(props: {
     const label = attribution() ? "Unassigned" : "Awaiting match"
     return unknown ? [...sessions, { sessionID: undefined, label, files: unknown }] : sessions
   })
+  const sessionGroupIDs = createMemo(() => groups().flatMap(({ sessionID }) => (sessionID ? [sessionID] : [])))
+  const canToggleAll = () => !statusError() && sessionGroupIDs().length > 0
+  const allCollapsed = () => sessionGroupIDs().every((sessionID) => props.collapsedSessions().has(sessionID))
+  const allAction = () => (allCollapsed() ? "Expand all" : "Collapse all")
+  const toggleAll = () => {
+    if (canToggleAll()) props.setSessionsCollapsed(sessionGroupIDs(), !allCollapsed())
+  }
+  props.context.keymap.layer(() => ({
+    mode: "global",
+    commands: [
+      {
+        id: "sidebar-git-diff.toggle-all",
+        title: `${allAction()} Git change groups`,
+        group: "VCS",
+        palette: true,
+        enabled: canToggleAll,
+        run: toggleAll,
+      },
+    ],
+  }))
   const matchStatus = () => {
     const result = attribution()
     if (!result) return "Matching sessions…"
@@ -225,9 +245,26 @@ function Sidebar(props: {
   return (
     <Show when={statusError() || files().length > 0}>
       <box>
-        <text fg={theme.text.base}>
-          <b>Git changes ({files().length})</b>
-        </text>
+        <box flexDirection="row" justifyContent="space-between" gap={1}>
+          <text fg={theme.text.base} wrapMode="word" flexShrink={1} minWidth={0}>
+            <b>Git changes ({files().length})</b>
+          </text>
+          <Show when={canToggleAll()}>
+            <text
+              fg={theme.markdown.linkText}
+              attributes={TextAttributes.UNDERLINE}
+              flexShrink={0}
+              selectable={false}
+              onMouseUp={(event) => {
+                if (event.button !== MouseButton.LEFT || event.isDragging) return
+                event.stopPropagation()
+                toggleAll()
+              }}
+            >
+              {allAction()}
+            </text>
+          </Show>
+        </box>
         <Show
           when={statusError()}
           fallback={
@@ -250,7 +287,7 @@ function Sidebar(props: {
                             ? (event) => {
                                 if (event.button !== MouseButton.LEFT || event.isDragging) return
                                 event.stopPropagation()
-                                props.toggleSession(sessionID)
+                                props.setSessionsCollapsed([sessionID], expanded())
                               }
                             : undefined
                         }
@@ -323,10 +360,13 @@ export default Plugin.define({
   id: "sidebar-git-diff",
   setup(context) {
     const [collapsedSessions, setCollapsedSessions] = createSignal<ReadonlySet<string>>(new Set())
-    function toggleSession(sessionID: string) {
+    function setSessionsCollapsed(sessionIDs: readonly string[], collapsed: boolean) {
       setCollapsedSessions((current) => {
         const next = new Set(current)
-        if (!next.delete(sessionID)) next.add(sessionID)
+        for (const sessionID of sessionIDs) {
+          if (collapsed) next.add(sessionID)
+          else next.delete(sessionID)
+        }
         return next
       })
     }
@@ -340,7 +380,7 @@ export default Plugin.define({
               sessionID={input.sessionID}
               directory={directory}
               collapsedSessions={collapsedSessions}
-              toggleSession={toggleSession}
+              setSessionsCollapsed={setSessionsCollapsed}
             />
           )}
         </Show>
