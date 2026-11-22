@@ -1,0 +1,34 @@
+# Build prompt: sidebar-git-diff
+
+Implement `sidebar-git-diff`, a read-only, TUI-only OpenCode V2 plugin. Start with an empty repository and treat this document as the specification. The initial version is `0.5.0-beta.0`. Target OpenCode 2.3.2. Use TypeScript, Solid and OpenTUI. Read the [OpenCode TUI plugin guide](https://opencode.ai/docs/build/plugins/cli) and verify any built-in viewer behavior in the OpenCode 2.3.2 source. Do not depend on any private repository or plugin.
+
+## Outcome
+
+Append a **Git changes (N)** section to the session sidebar using the `sidebar.content` slot. Show the uncommitted files in the active session’s Git worktree, grouped by the open session tab that last recorded a successful file edit. The grouping is an estimate, not proof that a session owns all changes in a file. Do not show a section for a clean worktree. If Git status cannot be read, show an error instead of reporting the worktree as clean.
+
+## Source of truth
+
+1. Use the plugin’s connected OpenCode client. Resolve the active session’s directory to its project and worktree root through `client.location.get`. Read `client.vcs.status` at that root. Use the full returned file paths relative to the worktree root as matching keys. The server might run on a different machine or OS from the terminal. Do not shell out to Git or access the client machine’s filesystem.
+2. Use open root session tabs as the candidates, including the current root if missing. If tabs are off, use the current session. Read details with `client.session.get`. Only inspect sessions for the same project and worktree, including sessions launched in a subdirectory of that worktree. Do not treat another worktree of the same repository as a match.
+3. Read recent messages in descending order with `client.message.list`. Scan at most four pages of 25 messages per session, and at most 30 candidate sessions. Follow the cursor while full pages are returned. Indicate partial history if the limits or a read failure prevent a complete scan of the relevant history. Limit history reads to four sessions at a time. Reuse a session’s cached result if its update timestamp is unchanged.
+4. Count only completed assistant file-tool calls. For `write`, use the input `path`. For `edit` and `patch`, use the `file` entries in the tool’s `metadata.files` array. Use the tool completion time, or the assistant message completion time if the tool doesn’t have one. Ignore calls without a usable time or path. Do not count failed or running tools, shell commands, inferred edits from assistant text, or inherited history from before a fork was created.
+5. Normalize paths using the server’s path rules. Resolve relative tool paths against the session directory at edit time. When walking back across a location switch, continue only if the previous location was in the same worktree, and use its directory for earlier edits. Ignore paths outside the worktree and leading-tilde paths whose server home cannot be resolved. Compare root-relative paths using `/` separators. Do not normalize display strings and use those strings as identity.
+6. For each file in Git status, pick the open tab with the uniquely latest recorded edit time. Show unmatched files and ties under **Unassigned**. Show **Awaiting match** while the first attribution scan is in progress. Preserve open-tab order for matched groups and place the unassigned group last. Never duplicate a file across groups.
+7. Refresh on mount and ten seconds after each scan finishes. Allow ten seconds for the status read and fifteen seconds for attribution. Cancel network reads and scheduled refresh when the section unmounts or the active directory changes. Do not add a refresh loop that overlaps a pending scan.
+
+## Sidebar interactions
+
+- Session headings use the session title, with the session ID as a fallback. Groups start open. Use a clickable `▼` heading when expanded and `▶` when collapsed. Show the file count on a collapsed heading. Track collapse by session ID in client memory so it survives polling, session switches, and returning from the diff viewer. Do not persist it to disk. The unassigned group is not collapsible.
+- Render the status in a separate white `[A]`, `[M]`, or `[D]` badge. Keep it legible in light and dark themes. The badge is not a link. Render the filename as an underlined, wrapping link. Replace control characters for display only. Ignore right-clicks and drags.
+- A filename click opens OpenCode’s **built-in full-screen Uncommitted** diff viewer. Do not draw a custom popup, call a shell, or change the user’s diff settings. In OpenCode 2.3.2, call `ui.router.navigate` with plugin ID `opencode.diffs`, route name `diff`, and data containing `mode: "working"`, the current `sessionID`, and a session `returnRoute`. The built-in route does not accept an initial file, so users select the file in its tree. `Esc` returns to the originating session.
+
+## Package and publish
+
+Export a default `Plugin.define` from `@opencode/plugin/tui` with ID `sidebar-git-diff` and publish it through the package’s `./tui` export. Ship TSX source; OpenCode compiles it. Use an npm lockfile, MIT license, a README with installation through `cli.json`, and scripts for type checking, checking the package tarball, and verifying that a beta release tag matches the version. Do not include a server or GUI entry point. Use GitHub Actions for build checks on pull requests and main pushes. Prepare a separate npmjs.org workflow that publishes matching beta tags to `beta` via npm trusted publishing. Do not publish during development.
+
+## Acceptance checks
+
+- In a Git worktree with two open tabs, give each tab a different edited file and create a third file outside the OpenCode tools. The sidebar should show two session groups and one unassigned file. If the second tab later records a newer edit to the first tab’s file, the file should move to the second group on refresh.
+- Collapse one group. The other group stays open and a refresh does not reopen the collapsed group. A file from another worktree never affects the grouping.
+- Clicking a status badge does nothing. Clicking a filename opens the native **Uncommitted** view and its file tree. Pressing `Esc` returns to the same session with its collapse state intact.
+- Install or unpack the output of `npm pack` separately from the source checkout. Load its TUI entry point in OpenCode 2.3.2 and confirm the section works. Verify that an npm release cannot run on an ordinary branch push.
