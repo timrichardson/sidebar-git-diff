@@ -1,6 +1,6 @@
 # Build prompt: sidebar-git-diff
 
-Implement `sidebar-git-diff`, a read-only, TUI-only OpenCode V2 plugin. Start with an empty repository and treat this document as the specification. The initial version is `0.5.0-beta.0`. Target OpenCode 2.3.2. Use TypeScript, Solid and OpenTUI. Read the [OpenCode TUI plugin guide](https://opencode.ai/docs/build/plugins/cli) and verify any built-in viewer behavior in the OpenCode 2.3.2 source. Do not depend on any private repository or plugin.
+Implement `sidebar-git-diff`, a read-only, TUI-only OpenCode V2 plugin. Start with an empty repository and treat this document as the specification. The first stable version is `1.0.0`. Target OpenCode 2.3.2. Use TypeScript, Solid and OpenTUI. Read the [OpenCode TUI plugin guide](https://opencode.ai/docs/build/plugins/cli) and verify any built-in viewer behavior in the OpenCode 2.3.2 source. Do not depend on any private repository or plugin.
 
 ## Outcome
 
@@ -26,7 +26,7 @@ Append a **Git changes (N)** section to the session sidebar using the `sidebar.c
 
 ## Package and publish
 
-Export a default `Plugin.define` from `@opencode/plugin/tui` with ID `sidebar-git-diff` and publish it through the package’s `./tui` export. Ship TSX source; OpenCode compiles it. Use an npm lockfile, MIT license, a README with installation through `cli.json`, and scripts for type checking and checking the package tarball. Do not include a server or GUI entry point. Use GitHub Actions for package checks. A separate workflow on pushes to `main` publishes to npm’s `beta` tag via trusted publishing. Compare commits against the source commit recorded by npm for the last beta. Use the largest version bump: major for a breaking-change marker, minor for `feat:`, and patch otherwise. Keep the `-beta.0` suffix on each new version. Do not publish again if the commit is already included in a published beta.
+Export a default `Plugin.define` from `@opencode/plugin/tui` with ID `sidebar-git-diff` and publish it through the package’s `./tui` export. Ship TSX source; OpenCode compiles it. Use an npm lockfile, MIT license, a README with installation through `cli.json`, and scripts for type checking and checking the package tarball. Do not include a server or GUI entry point. Use GitHub Actions for package checks. A separate workflow on pushes to `main` publishes to npm’s `latest` tag via trusted publishing. Use the package version to promote `latest` from beta to stable. After that, compare commits against the source commit recorded by npm for the last release. Use the largest version bump: major for a breaking-change marker, minor for `feat:`, and patch otherwise. Do not publish again if the commit is already included in the latest release.
 
 ## Acceptance checks
 

@@ -1,11 +1,11 @@
-name: Publish beta to npm
+name: Publish to npm
 
 on:
   push:
     branches: [main]
 
 concurrency:
-  group: publish-beta
+  group: publish-npm
   cancel-in-progress: false
 
 permissions:
@@ -29,19 +29,19 @@ jobs:
           node-version: "26"
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
-      - name: Determine the next beta version
+      - name: Determine the next version
         id: version
         shell: bash
         run: |
-          version=$(npm view sidebar-git-diff@beta version gitHead --json --prefer-online \
+          version=$(npm view sidebar-git-diff@latest version gitHead --json --prefer-online \
             | npm run --silent release:next)
           echo "value=$version" >> "$GITHUB_OUTPUT"
-      - name: Check and publish the beta
+      - name: Check and publish the release
         if: steps.version.outputs.value != ''
         env:
           VERSION: ${{ steps.version.outputs.value }}
         run: |
           npm ci --ignore-scripts
-          npm version "$VERSION" --no-git-tag-version --ignore-scripts
+          npm version "$VERSION" --allow-same-version --no-git-tag-version --ignore-scripts
           npm run check
-          npm publish --ignore-scripts --access public --tag beta
+          npm publish --ignore-scripts --access public --tag latest

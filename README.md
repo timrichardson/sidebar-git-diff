@@ -1,6 +1,6 @@
 # sidebar-git-diff
 
-**Beta · OpenCode V2**
+**OpenCode V2**
 
 The sidebar groups uncommitted changes by OpenCode session name, links each filename to `/diff`, and shows the worktree, branch, and number of commits ahead of the tracked remote branch.
 
@@ -8,7 +8,7 @@ The sidebar groups uncommitted changes by OpenCode session name, links each file
 
 ## Install and update
 
-The beta targets the **OpenCode 2.3.2 terminal UI**. OpenCode V1 and the Desktop GUI are not supported.
+The plugin targets the **OpenCode 2.3.2 terminal UI**. OpenCode V1 and the Desktop GUI are not supported.
 
 **OpenCode snapshots are not required.** The sidebar reads Git status and groups files using recorded `write`, `edit`, and `patch` calls. Its links open the **Uncommitted** diff, which reads the Git working copy.
 
@@ -42,18 +42,18 @@ OpenCode watches the local plugin files and normally reloads them after the pull
 
 ### From npm
 
-**Install:** Add `sidebar-git-diff@beta` to `plugins` in `cli.json`. OpenCode downloads the package for you. Run `/reload` if the plugin does not appear after saving.
+**Install:** Add `sidebar-git-diff@latest` to `plugins` in `cli.json`. If you used the beta, replace the `sidebar-git-diff@beta` entry. OpenCode downloads the package for you. Run `/reload` if the plugin does not appear after saving.
 
 ```json
 {
-  "plugins": ["sidebar-git-diff@beta"]
+  "plugins": ["sidebar-git-diff@latest"]
 }
 ```
 
-**Update:** The `beta` tag does not auto-update. Ask OpenCode to check for and install the newer beta:
+**Update:** To check for and install an update manually, ask OpenCode to update the configured package:
 
 ```sh
-opencode plugin update sidebar-git-diff@beta
+opencode plugin update sidebar-git-diff@latest
 ```
 
 After the update, open a fresh OpenCode terminal UI to load the new package. In OpenCode 2.3.2, `/reload` can leave the old package running in an open TUI. You do not need to restart the background service. See [OpenCode’s plugin update documentation](https://opencode.ai/docs/plugins#manage) for other version selectors.
@@ -89,17 +89,17 @@ npm run check
 
 OpenCode compiles the TSX entry point at load time. There is no separate build step. [`PROMPT.md`](PROMPT.md) is a standalone specification you can give to a model to recreate the plugin without the source.
 
-## Automatic beta releases
+## Automatic releases
 
-Push to `main` to publish a new beta. GitHub Actions runs the package checks first. It publishes to npm’s `beta` tag and does not move `latest`. Pull requests and pushes to other branches do not publish. You do not need to bump `package.json` or create a Git tag.
+Push to `main` to publish a new release. GitHub Actions runs the package checks first, then publishes to npm’s `latest` tag. Pull requests and pushes to other branches do not publish. You do not need to bump `package.json` or create a Git tag for subsequent releases.
 
-The workflow reads commit messages since the last published beta and applies the largest bump. These examples start from `0.5.0-beta.0`:
+The workflow reads commit messages since the last published version and applies the largest bump. These examples start from `1.0.0`:
 
-| Commit message | Bump | New beta |
+| Commit message | Bump | New version |
 | --- | --- | --- |
-| `feat!: remove an old option` or a `BREAKING CHANGE:` footer | Major | `1.0.0-beta.0` |
-| `feat: add a sidebar filter` | Minor | `0.6.0-beta.0` |
-| `fix: correct file grouping`, docs-only changes, or any other commit | Patch | `0.5.1-beta.0` |
+| `feat!: remove an old option` or a `BREAKING CHANGE:` footer | Major | `2.0.0` |
+| `feat: add a sidebar filter` | Minor | `1.1.0` |
+| `fix: correct file grouping`, docs-only changes, or any other commit | Patch | `1.0.1` |
 
 Label features and breaking changes using [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). If you squash a pull request, put the intended label on the squash commit. If pushes arrive close together, one release can include changes from several pushes.
 
