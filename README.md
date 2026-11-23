@@ -58,6 +58,8 @@ After the update, open a fresh OpenCode terminal UI to load the new package. In 
 
 Open a session. If its sidebar is hidden, use the **Toggle sidebar** command.
 
+![OpenCode Git changes sidebar showing an expanded session, its worktree and branch status, and clickable changed files](https://raw.githubusercontent.com/timrichardson/sidebar-git-diff/main/docs/sidebar-screenshot.png)
+
 - Click a session heading to collapse or reopen it. Groups start expanded.
 - Under each session heading, `worktree · branch (+3)` shows the worktree folder, checked-out branch, and commits ahead of the locally stored upstream. `(-)` means there is no usable remote tracking branch. `(?)` means the count is unavailable, including when using `--server`.
 - Click **Collapse all** or **Expand all** next to **Git changes** to update every listed session group. The same action is available in the command palette (`Ctrl+P` by default). **Unassigned** stays visible.
