@@ -1,16 +1,20 @@
 # sidebar-git-diff
 
-**Beta · `0.5.0-beta.0` · OpenCode V2**
+**Beta · OpenCode V2**
 
-See which files are uncommitted in your Git worktree and which open OpenCode session last recorded an edit to each file.
+The sidebar groups uncommitted changes by OpenCode session name, links each filename to `/diff`, and shows the worktree, branch, and number of commits ahead of the tracked remote branch.
+
+![OpenCode Git changes sidebar showing an expanded session, its worktree and branch status, and clickable changed files](https://raw.githubusercontent.com/timrichardson/sidebar-git-diff/main/docs/sidebar-screenshot.png)
 
 ## Install and update
 
 The beta targets the **OpenCode 2.3.2 terminal UI**. OpenCode V1 and the Desktop GUI are not supported.
 
+**OpenCode snapshots are not required.** The sidebar reads Git status and groups files using recorded `write`, `edit`, and `patch` calls. Its links open the **Uncommitted** diff, which reads the Git working copy.
+
 Add the plugin to `~/.config/opencode/cli.json` (or `$XDG_CONFIG_HOME/opencode/cli.json` if set), not `opencode.jsonc`. Keep any existing `plugins` entries. Use only one of the installation methods below. If you already use a local copy of the original sidebar plugin, disable or remove it from plugin discovery first to avoid a duplicate sidebar section.
 
-### From GitHub (available now)
+### From GitHub
 
 **Install:** Clone the repository. No npm install or build is needed.
 
@@ -36,7 +40,7 @@ git -C "$HOME/sidebar-git-diff" pull --ff-only
 
 OpenCode watches the local plugin files and normally reloads them after the pull. If the sidebar does not refresh, run `/reload` in OpenCode.
 
-### From npm (after the first beta is published)
+### From npm
 
 **Install:** Add `sidebar-git-diff@beta` to `plugins` in `cli.json`. OpenCode downloads the package for you. Run `/reload` if the plugin does not appear after saving.
 
@@ -57,8 +61,6 @@ After the update, open a fresh OpenCode terminal UI to load the new package. In 
 ## Use the sidebar
 
 Open a session. If its sidebar is hidden, use the **Toggle sidebar** command.
-
-![OpenCode Git changes sidebar showing an expanded session, its worktree and branch status, and clickable changed files](https://raw.githubusercontent.com/timrichardson/sidebar-git-diff/main/docs/sidebar-screenshot.png)
 
 - Click a session heading to collapse or reopen it. Groups start expanded.
 - Under each session heading, `worktree · branch (+3)` shows the worktree folder, checked-out branch, and commits ahead of the locally stored upstream. `(-)` means there is no usable remote tracking branch. `(?)` means the count is unavailable, including when using `--server`.
@@ -87,10 +89,18 @@ npm run check
 
 OpenCode compiles the TSX entry point at load time. There is no separate build step. [`PROMPT.md`](PROMPT.md) is a standalone specification you can give to a model to recreate the plugin without the source.
 
-## Publish a beta
+## Automatic beta releases
 
-GitHub Actions checks pull requests and pushes to `main` without publishing. The `release.yml` workflow publishes only when you push a tag that matches the beta version in `package.json`. It publishes under npm’s `beta` tag, not `latest`.
+Push to `main` to publish a new beta. GitHub Actions runs the package checks first. It publishes to npm’s `beta` tag and does not move `latest`. Pull requests and pushes to other branches do not publish. You do not need to bump `package.json` or create a Git tag.
 
-1. For a new npm package, an authorized maintainer must first publish from an authenticated npm account using `npm publish --access public --tag beta` after running `npm run check`. Do not push a publishing tag for a version already on npm.
-2. In the npm package’s settings, add a **GitHub Actions** trusted publisher. Set the owner to `timrichardson`, repository to `sidebar-git-diff`, and workflow filename to `release.yml`. Enable `npm publish`. No GitHub npm token secret is needed.
-3. For subsequent releases, update `package.json` and `package-lock.json` to a new beta version. Run `npm run check` and check the intended tag (for example, `npm run release:check -- v0.5.0-beta.1`). Commit and push the version update. Push the matching tag only when you intend to publish to npm.
+The workflow reads commit messages since the last published beta and applies the largest bump. These examples start from `0.5.0-beta.0`:
+
+| Commit message | Bump | New beta |
+| --- | --- | --- |
+| `feat!: remove an old option` or a `BREAKING CHANGE:` footer | Major | `1.0.0-beta.0` |
+| `feat: add a sidebar filter` | Minor | `0.6.0-beta.0` |
+| `fix: correct file grouping`, docs-only changes, or any other commit | Patch | `0.5.1-beta.0` |
+
+Label features and breaking changes using [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). If you squash a pull request, put the intended label on the squash commit. If pushes arrive close together, one release can include changes from several pushes.
+
+In the npm package’s settings, the **GitHub Actions** trusted publisher must allow `npm publish` for owner `timrichardson`, repository `sidebar-git-diff`, and workflow `release.yml`. No GitHub npm token secret is needed.

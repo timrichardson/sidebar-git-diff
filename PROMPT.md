@@ -26,7 +26,7 @@ Append a **Git changes (N)** section to the session sidebar using the `sidebar.c
 
 ## Package and publish
 
-Export a default `Plugin.define` from `@opencode/plugin/tui` with ID `sidebar-git-diff` and publish it through the package’s `./tui` export. Ship TSX source; OpenCode compiles it. Use an npm lockfile, MIT license, a README with installation through `cli.json`, and scripts for type checking, checking the package tarball, and verifying that a beta release tag matches the version. Do not include a server or GUI entry point. Use GitHub Actions for build checks on pull requests and main pushes. Prepare a separate npmjs.org workflow that publishes matching beta tags to `beta` via npm trusted publishing. Do not publish during development.
+Export a default `Plugin.define` from `@opencode/plugin/tui` with ID `sidebar-git-diff` and publish it through the package’s `./tui` export. Ship TSX source; OpenCode compiles it. Use an npm lockfile, MIT license, a README with installation through `cli.json`, and scripts for type checking and checking the package tarball. Do not include a server or GUI entry point. Use GitHub Actions for package checks. A separate workflow on pushes to `main` publishes to npm’s `beta` tag via trusted publishing. Compare commits against the source commit recorded by npm for the last beta. Use the largest version bump: major for a breaking-change marker, minor for `feat:`, and patch otherwise. Keep the `-beta.0` suffix on each new version. Do not publish again if the commit is already included in a published beta.
 
 ## Acceptance checks
 
@@ -35,4 +35,4 @@ Export a default `Plugin.define` from `@opencode/plugin/tui` with ID `sidebar-gi
 - Use **Collapse all** and **Expand all** to update both groups without hiding unassigned files. When the list is taller than the sidebar, scroll down until the last file is visible. Use the command palette to toggle the groups while the sidebar heading is off-screen.
 - Check the status line with an ahead branch, a branch in sync, and a branch with no remote tracking ref. Verify that it remains visible when a session group is collapsed.
 - Clicking a status badge does nothing. Clicking a filename opens the native **Uncommitted** view and its file tree. Pressing `Esc` returns to the same session with its collapse state intact.
-- Install or unpack the output of `npm pack` separately from the source checkout. Load its TUI entry point in OpenCode 2.3.2 and confirm the section works. Verify that an npm release cannot run on an ordinary branch push.
+- Install or unpack the output of `npm pack` separately from the source checkout. Load its TUI entry point in OpenCode 2.3.2 and confirm the section works. Verify that only pushes to `main` can publish, and that `fix:`, `feat:`, and breaking changes choose the expected versions.

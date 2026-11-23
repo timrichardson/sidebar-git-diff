@@ -16,7 +16,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm pack --dry-run",
-    "release:check": "node scripts/check-release.mjs"
+    "release:next": "node scripts/next-release.mjs"
   },
   "dependencies": {
     "@opencode/plugin": "2.3.2"
