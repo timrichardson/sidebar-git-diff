@@ -1,20 +1,32 @@
 /** @jsxImportSource @opentui/solid */
 import { execFile } from "node:child_process"
+import { randomUUID } from "node:crypto"
 import { posix, win32 } from "node:path"
 import type { LocationGetOutput, SessionInfo, SessionMessageAssistantTool, VcsFileStatus } from "@opencode/client"
 import { Plugin } from "@opencode/plugin/tui"
 import { MouseButton, TextAttributes } from "@opentui/core"
 import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { unwrap } from "solid-js/store"
 
 const SESSION_LIMIT = 30
-const PAGE_SIZE = 25
-const PAGE_LIMIT = 4
+const PAGE_SIZE = 50
+const PAGES_PER_REFRESH = 4
 const CONCURRENCY = 4
 const REFRESH_MS = 10_000
 
-type History = { edits: Map<string, number>; limited: boolean }
+type History = { edits: ReadonlyMap<string, number>; partial: boolean }
 type SessionChanges = { session: SessionInfo; history: History }
 type Scope = Pick<SessionInfo, "location" | "subpath">
+type Checkpoint = {
+  revision: string
+  scope: string
+  directory: string | null
+  position?: { cursor: string; messageID: string }
+  edits: [string, number][]
+  synced?: { updated: number; idle?: number }
+}
+type EditIndex = Record<string, Checkpoint | undefined>
+type IndexUpdate = { sessionID: string; expectedRevision?: string; checkpoint?: Checkpoint }
 
 function serverPath(root: string) {
   return root.startsWith("/") ? posix : win32
@@ -46,32 +58,79 @@ function writtenPaths(tool: SessionMessageAssistantTool): string[] {
   )
 }
 
-/** Return the last recorded file-tool completion for each path in this worktree. */
+/** Resume after the last settled page. An active assistant message can still gain tool results. */
 async function readHistory(
   client: Plugin.Context["client"],
   session: SessionInfo,
   root: string,
+  previous: Checkpoint | undefined,
   signal: AbortSignal,
-): Promise<History> {
-  const edits = new Map<string, number>()
+): Promise<History & { checkpoint?: Checkpoint }> {
+  const scope = JSON.stringify([session.projectID, root, session.time.created])
+  let checkpoint = previous?.scope === scope ? previous : undefined
+  let position = checkpoint?.position
+  let directory = checkpoint?.directory
+  const edits = new Map(checkpoint?.edits)
   const path = serverPath(root)
-  let directory = session.location.directory
-  let cursor: string | undefined
-  for (let page = 0; page < PAGE_LIMIT; page++) {
-    const result = await client.message.list(
-      { sessionID: session.id, limit: PAGE_SIZE, ...(cursor ? { cursor } : { order: "desc" }) },
-      { signal },
-    )
-    for (const message of result.data) {
-      // A fork inherits its source history. Do not count copied messages as new edits.
-      if (session.fork && message.time.created < session.time.created) return { edits, limited: false }
-      if (message.type === "location-switched") {
-        if (!message.previous || !inWorktree(message.previous, root)) return { edits, limited: false }
-        // Older tool paths are relative to the session directory before the move.
-        directory = message.previous.location.directory
-        continue
+  const { updated, idle, busy } = session.time
+  if (checkpoint?.synced?.updated === updated && checkpoint.synced.idle === idle && (busy ?? 0) <= (idle ?? 0)) {
+    return { edits, checkpoint, partial: false }
+  }
+
+  function directoryInWorktree(place: (Scope & { projectID?: SessionInfo["projectID"] }) | null | undefined) {
+    return place && (!place.projectID || place.projectID === session.projectID) && inWorktree(place, root)
+      ? place.location.directory
+      : null
+  }
+
+  try {
+    for (let page = 0; page < PAGES_PER_REFRESH; page++) {
+      if (directory === undefined) {
+        const { data: [firstMove] } = await client.message.list(
+          { sessionID: session.id, order: "asc", type: "location-switched", limit: 1 },
+          { signal },
+        )
+        directory =
+          firstMove?.type === "location-switched" ? directoryInWorktree(firstMove.previous) : session.location.directory
       }
-      if (message.type === "assistant") {
+
+      const result = await client.message.list(
+        { sessionID: session.id, limit: PAGE_SIZE, ...(position ? { cursor: position.cursor } : { order: "asc" }) },
+        { signal },
+      )
+      // A committed revert can remove the cursor's message. An empty page alone is not proof.
+      if (page === 0 && position && result.data.length === 0) {
+        try {
+          await client.session.message.get({ sessionID: session.id, messageID: position.messageID }, { signal })
+        } catch (error) {
+          if (!(typeof error === "object" && error && "_tag" in error && error._tag === "MessageNotFoundError")) throw error
+          checkpoint = undefined
+          position = undefined
+          directory = undefined
+          edits.clear()
+          continue
+        }
+      }
+
+      let unsettled = false
+      for (const message of result.data) {
+        if (message.type === "location-switched") {
+          directory = directoryInWorktree(message)
+          // A return to this worktree starts a new attribution span.
+          if (!directory) edits.clear()
+          continue
+        }
+        if (message.type !== "assistant" || !directory) continue
+        // A fork inherits its source history. Do not count copied edits.
+        if (session.fork && message.time.created < session.time.created) continue
+        if (
+          message.time.completed === undefined &&
+          message.time.created > (idle ?? -Infinity) &&
+          message.time.created >= (busy ?? updated)
+        ) {
+          unsettled = true
+        }
+
         for (const part of message.content) {
           if (part.type !== "tool") continue
           const time = part.time.completed ?? message.time.completed
@@ -84,12 +143,27 @@ async function readHistory(
           }
         }
       }
+      const caughtUp = !result.cursor.next || result.data.length < PAGE_SIZE
+      // Show completed tools in the active page, but read it again before saving its cursor.
+      if (unsettled) return { edits, checkpoint, partial: !caughtUp }
+
+      const last = result.data.at(-1)
+      if (last && result.cursor.next) position = { cursor: result.cursor.next, messageID: last.id }
+      const synced = caughtUp ? { updated, idle } : undefined
+      if (
+        position !== checkpoint?.position ||
+        directory !== checkpoint?.directory ||
+        synced?.updated !== checkpoint?.synced?.updated ||
+        synced?.idle !== checkpoint?.synced?.idle
+      ) {
+        checkpoint = { revision: randomUUID(), scope, directory, position, edits: [...edits], synced }
+      }
+      if (caughtUp) return { edits, checkpoint, partial: false }
     }
-    cursor = result.cursor.next ?? undefined
-    // OpenCode may return a cursor for the last non-empty page.
-    if (!cursor || result.data.length < PAGE_SIZE) return { edits, limited: false }
+  } catch {
+    return { edits: new Map(checkpoint?.edits), checkpoint, partial: true }
   }
-  return { edits, limited: true }
+  return { edits, checkpoint, partial: true }
 }
 
 function displayPath(file: string) {
@@ -132,6 +206,8 @@ function Sidebar(props: {
   context: Plugin.Context
   sessionID: string
   directory: string
+  editIndex: EditIndex
+  saveIndex: (updates: IndexUpdate[]) => Promise<void>
   collapsedSessions: () => ReadonlySet<string>
   setSessionsCollapsed: (sessionIDs: readonly string[], collapsed: boolean) => void
 }) {
@@ -141,7 +217,6 @@ function Sidebar(props: {
   const [worktreeStatus, setWorktreeStatus] = createSignal<string>()
   const [attribution, setAttribution] = createSignal<{ sessions: Map<string, SessionChanges>; partial: boolean }>()
   let scope: LocationGetOutput | undefined
-  let cache = new Map<string, SessionChanges>()
   let timer: ReturnType<typeof setTimeout> | undefined
   const lifetime = new AbortController()
   // In the OpenCode 2.3.2 CLI, an explicit --server can point to a different filesystem.
@@ -191,6 +266,7 @@ function Sidebar(props: {
       const open = tabs()
       const candidates = open.slice(0, SESSION_LIMIT)
       const next = new Map<string, SessionChanges>()
+      const updates: IndexUpdate[] = []
       let partial = open.length > candidates.length
       for (let offset = 0; offset < candidates.length; offset += CONCURRENCY) {
         if (signal.aborted) {
@@ -201,11 +277,13 @@ function Sidebar(props: {
           candidates.slice(offset, offset + CONCURRENCY).map(async ({ sessionID }) => {
             const session = await client.session.get({ sessionID }, { signal })
             if (session.projectID !== scope?.project.id || !inWorktree(session, root)) return
-            const previous = cache.get(session.id)
-            const history =
-              previous?.session.time.updated === session.time.updated
-                ? previous.history
-                : await readHistory(client, session, root, signal)
+            const stored = props.editIndex[session.id]
+            // Storage can update while an API read is in flight.
+            const before = stored && structuredClone(unwrap(stored))
+            const history = await readHistory(client, session, root, before, signal)
+            if (before?.revision !== history.checkpoint?.revision) {
+              updates.push({ sessionID: session.id, expectedRevision: before?.revision, checkpoint: history.checkpoint })
+            }
             return { session, history }
           }),
         )
@@ -216,13 +294,17 @@ function Sidebar(props: {
           }
           const entry = result.value
           if (!entry) continue
-          partial ||= entry.history.limited
+          partial ||= entry.history.partial
           next.set(entry.session.id, entry)
         }
       }
       if (lifetime.signal.aborted) return
-      cache = next
       setAttribution({ sessions: next, partial })
+      if (updates.length) {
+        await props.saveIndex(updates).catch(() => {
+          if (!lifetime.signal.aborted) setAttribution({ sessions: next, partial: true })
+        })
+      }
     } catch {
       if (!lifetime.signal.aborted) setAttribution({ sessions: new Map(), partial: true })
     } finally {
@@ -291,7 +373,7 @@ function Sidebar(props: {
   const matchStatus = () => {
     const result = attribution()
     if (!result) return "Matching sessions…"
-    return result.partial ? "Recent file edits · partial history" : "Latest recorded file edits"
+    return result.partial ? "Indexed file edits · partial history" : "Latest recorded file edits"
   }
   const marker = { added: "A", deleted: "D", modified: "M" } as const
 
@@ -417,6 +499,16 @@ function Sidebar(props: {
 export default Plugin.define({
   id: "sidebar-git-diff",
   setup(context) {
+    const [editIndex, updateIndex] = context.storage.store<EditIndex>("edit-index-v1", { initial: {} })
+    const saveIndex = (updates: IndexUpdate[]) =>
+      updateIndex((draft) => {
+        for (const { sessionID, expectedRevision, checkpoint } of updates) {
+          // Another TUI may already have advanced this session's checkpoint.
+          if (draft[sessionID]?.revision !== expectedRevision) continue
+          if (checkpoint) draft[sessionID] = checkpoint
+          else delete draft[sessionID]
+        }
+      })
     const [collapsedSessions, setCollapsedSessions] = createSignal<ReadonlySet<string>>(new Set())
     function setSessionsCollapsed(sessionIDs: readonly string[], collapsed: boolean) {
       setCollapsedSessions((current) => {
@@ -437,6 +529,8 @@ export default Plugin.define({
               context={context}
               sessionID={input.sessionID}
               directory={directory}
+              editIndex={editIndex}
+              saveIndex={saveIndex}
               collapsedSessions={collapsedSessions}
               setSessionsCollapsed={setSessionsCollapsed}
             />
