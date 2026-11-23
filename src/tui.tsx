@@ -1,4 +1,5 @@
 /** @jsxImportSource @opentui/solid */
+import { execFile } from "node:child_process"
 import { posix, win32 } from "node:path"
 import type { LocationGetOutput, SessionInfo, SessionMessageAssistantTool, VcsFileStatus } from "@opencode/client"
 import { Plugin } from "@opencode/plugin/tui"
@@ -95,6 +96,38 @@ function displayPath(file: string) {
   return file.replaceAll(/[\x00-\x1f\x7f-\x9f]/g, "�")
 }
 
+/** Count commits against the local copy of the remote tracking branch, without contacting the remote. */
+function readAhead(root: string, branch: string, signal: AbortSignal) {
+  const ref = `refs/heads/${branch}`
+  const env: NodeJS.ProcessEnv = { ...process.env, LC_ALL: "C", GIT_NO_LAZY_FETCH: "1", GIT_TERMINAL_PROMPT: "0" }
+  delete env.GIT_COMMON_DIR
+  delete env.GIT_NAMESPACE
+  return new Promise<string>((resolve) => {
+    execFile(
+      "git",
+      [
+        "--git-dir=.git",
+        "--work-tree=.",
+        "for-each-ref",
+        "--count=1",
+        "--format=%(refname)%00%(HEAD)%00%(upstream:remotename)%00%(upstream:track,nobracket)",
+        "--",
+        ref,
+      ],
+      { cwd: root, env, signal, maxBuffer: 16_384, windowsHide: true },
+      (error, output) => {
+        if (error) return resolve("?")
+        const [name, head, remote, tracking] = output.trimEnd().split("\0")
+        if (name !== ref || head !== "*") return resolve("?")
+        if (!remote || remote === "." || tracking === "gone") return resolve("-")
+        const ahead = tracking?.match(/^ahead (\d+)(?:,|$)/)?.[1]
+        if (ahead !== undefined) return resolve(`+${ahead}`)
+        resolve(tracking === "" || (tracking && /^behind \d+$/.test(tracking)) ? "+0" : "?")
+      },
+    )
+  })
+}
+
 function Sidebar(props: {
   context: Plugin.Context
   sessionID: string
@@ -105,17 +138,34 @@ function Sidebar(props: {
   const { client, data, theme, ui } = props.context
   const [files, setFiles] = createSignal<VcsFileStatus[]>([])
   const [statusError, setStatusError] = createSignal(false)
+  const [worktreeStatus, setWorktreeStatus] = createSignal<string>()
   const [attribution, setAttribution] = createSignal<{ sessions: Map<string, SessionChanges>; partial: boolean }>()
   let scope: LocationGetOutput | undefined
   let cache = new Map<string, SessionChanges>()
   let timer: ReturnType<typeof setTimeout> | undefined
   const lifetime = new AbortController()
+  // In the OpenCode 2.3.2 CLI, an explicit --server can point to a different filesystem.
+  const local = !process.argv.some((arg) => arg === "--server" || arg.startsWith("--server="))
   const tabs = createMemo(() => {
     if (!ui.tabs.enabled()) return [{ sessionID: props.sessionID, title: undefined }]
     const open = ui.tabs.list()
     const rootID = data.session.root(props.sessionID)
     return open.some((tab) => tab.sessionID === rootID) ? open : [...open, { sessionID: rootID, title: undefined }]
   })
+
+  async function refreshWorktreeStatus(root: string) {
+    const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(3_000)])
+    const vcs = await client.vcs
+      .get({ location: { directory: root } }, { signal })
+      .then(({ data }) => data, () => undefined)
+    const branch = vcs?.branch.current
+    let ahead = "?"
+    if (vcs?.provider === "git" && !branch) ahead = "-"
+    if (vcs?.provider === "git" && branch && local) ahead = await readAhead(root, branch, signal)
+    const worktree = serverPath(root).basename(root) || root
+    const branchLabel = branch ?? (vcs?.provider === "git" ? "detached HEAD" : "branch unavailable")
+    if (!lifetime.signal.aborted) setWorktreeStatus(`${displayPath(worktree)} · ${displayPath(branchLabel)} (${ahead})`)
+  }
 
   async function refresh() {
     let root: string
@@ -135,6 +185,7 @@ function Sidebar(props: {
       return
     }
 
+    const branchStatus = refreshWorktreeStatus(root)
     try {
       const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(15_000)])
       const open = tabs()
@@ -174,6 +225,8 @@ function Sidebar(props: {
       setAttribution({ sessions: next, partial })
     } catch {
       if (!lifetime.signal.aborted) setAttribution({ sessions: new Map(), partial: true })
+    } finally {
+      await branchStatus
     }
   }
 
@@ -300,6 +353,11 @@ function Sidebar(props: {
                           <span style={{ fg: theme.text.muted }}> ({group.files.length})</span>
                         </Show>
                       </text>
+                      <Show when={sessionID && worktreeStatus()}>
+                        <text fg={theme.text.muted} wrapMode="word">
+                          {worktreeStatus()}
+                        </text>
+                      </Show>
                       <Show when={expanded()}>
                         <For each={group.files}>
                           {(file) => (

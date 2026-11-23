@@ -59,6 +59,7 @@ After the update, open a fresh OpenCode terminal UI to load the new package. In 
 Open a session. If its sidebar is hidden, use the **Toggle sidebar** command.
 
 - Click a session heading to collapse or reopen it. Groups start expanded.
+- Under each session heading, `worktree · branch (+3)` shows the worktree folder, checked-out branch, and commits ahead of the locally stored upstream. `(-)` means there is no usable remote tracking branch. `(?)` means the count is unavailable, including when using `--server`.
 - Click **Collapse all** or **Expand all** next to **Git changes** to update every listed session group. The same action is available in the command palette (`Ctrl+P` by default). **Unassigned** stays visible.
 - Click a filename to open OpenCode’s full-screen **Uncommitted** diff viewer. The white `[A]`, `[M]`, and `[D]` badges are not links.
 - Files without a reliable match stay under **Unassigned**. A match identifies a recent recorded edit, not ownership of every line in the patch.
@@ -71,7 +72,7 @@ The plugin reads Git status from the connected OpenCode server. It checks up to 
 
 The filename opens the native diff viewer, not a separate preview. OpenCode 2.3.2 does not expose initial file selection to plugins. Select the file in the viewer’s file tree. The viewer uses the session’s working directory, so open it from the worktree root to review files outside that directory. `Esc` returns to the session.
 
-The plugin is read-only. It does not run Git commands, change files, or send data to a service other than the OpenCode server already connected to the TUI.
+The plugin is read-only. It uses the connected OpenCode server for file status and attribution. With a local OpenCode server, it reads the ahead count with `git for-each-ref`. It never fetches, pushes, or changes Git state. The count reflects the remote tracking ref as of the last fetch.
 
 ## Develop
 
