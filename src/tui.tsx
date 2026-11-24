@@ -5,41 +5,51 @@ import { posix, win32 } from "node:path"
 import type { LocationGetOutput, SessionInfo, SessionMessageAssistantTool, VcsFileStatus } from "@opencode/client"
 import { Plugin } from "@opencode/plugin/tui"
 import { MouseButton, TextAttributes } from "@opentui/core"
-import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js"
+import { createMemo, createResource, createSignal, For, Match, onCleanup, onMount, Show, Switch } from "solid-js"
 import { unwrap } from "solid-js/store"
 
 const SESSION_LIMIT = 30
 const PAGE_SIZE = 50
 const PAGES_PER_REFRESH = 4
 const CONCURRENCY = 4
+const WORKTREE_LIMIT = 30
 const REFRESH_MS = 10_000
 
 type History = { edits: ReadonlyMap<string, number>; partial: boolean }
-type SessionChanges = { session: SessionInfo; history: History }
+type SessionChanges = { session: SessionInfo; root: string; history: History }
 type Scope = Pick<SessionInfo, "location" | "subpath">
 type Checkpoint = {
   revision: string
   scope: string
-  directory: string | null
+  directory: string
   position?: { cursor: string; messageID: string }
   edits: [string, number][]
   synced?: { updated: number; idle?: number }
 }
 type EditIndex = Record<string, Checkpoint | undefined>
 type IndexUpdate = { sessionID: string; expectedRevision?: string; checkpoint?: Checkpoint }
+type WorktreeChanges = { root: string; label: string; files: VcsFileStatus[]; error?: boolean }
+type SidebarScan = {
+  worktrees: WorktreeChanges[]
+  roots: string[]
+  sessions: Map<string, SessionChanges>
+  partial: boolean
+}
+type FileLink = { root: string; file: string; sessionID: string }
 
-function serverPath(root: string) {
-  return root.startsWith("/") ? posix : win32
+function serverPath(directory: string) {
+  return directory.startsWith("/") ? posix : win32
 }
 
-/** Compare worktree roots using server paths, including when the client runs on a different OS. */
-function inWorktree(scope: Scope, root: string) {
+function relativeFile(root: string, absolute: string) {
   const path = serverPath(root)
-  const subpath = path.relative(root, scope.location.directory).split(path.sep).join("/")
-  return (
-    !subpath ||
-    (subpath === scope.subpath && !subpath.startsWith("../") && subpath !== ".." && !path.isAbsolute(subpath))
-  )
+  const relative = path.relative(root, absolute)
+  const file = relative.split(path.sep).join("/")
+  return file === ".." || file.startsWith("../") || path.isAbsolute(relative) ? undefined : file
+}
+
+function sessionRoot(scope: Scope, roots: readonly string[]) {
+  return roots.find((root) => relativeFile(root, scope.location.directory) === (scope.subpath ?? ""))
 }
 
 /** Read paths from successful native mutations, not snapshots of a shared worktree. */
@@ -58,29 +68,21 @@ function writtenPaths(tool: SessionMessageAssistantTool): string[] {
   )
 }
 
-/** Resume after the last settled page. An active assistant message can still gain tool results. */
+/** Record server-absolute edit paths, including edits outside the session's assigned worktree. */
 async function readHistory(
   client: Plugin.Context["client"],
   session: SessionInfo,
-  root: string,
   previous: Checkpoint | undefined,
   signal: AbortSignal,
 ): Promise<History & { checkpoint?: Checkpoint }> {
-  const scope = JSON.stringify([session.projectID, root, session.time.created])
+  const scope = JSON.stringify([session.projectID, session.time.created])
   let checkpoint = previous?.scope === scope ? previous : undefined
   let position = checkpoint?.position
   let directory = checkpoint?.directory
   const edits = new Map(checkpoint?.edits)
-  const path = serverPath(root)
   const { updated, idle, busy } = session.time
   if (checkpoint?.synced?.updated === updated && checkpoint.synced.idle === idle && (busy ?? 0) <= (idle ?? 0)) {
     return { edits, checkpoint, partial: false }
-  }
-
-  function directoryInWorktree(place: (Scope & { projectID?: SessionInfo["projectID"] }) | null | undefined) {
-    return place && (!place.projectID || place.projectID === session.projectID) && inWorktree(place, root)
-      ? place.location.directory
-      : null
   }
 
   try {
@@ -91,7 +93,8 @@ async function readHistory(
           { signal },
         )
         directory =
-          firstMove?.type === "location-switched" ? directoryInWorktree(firstMove.previous) : session.location.directory
+          (firstMove?.type === "location-switched" ? firstMove.previous?.location.directory : undefined) ??
+          session.location.directory
       }
 
       const result = await client.message.list(
@@ -115,9 +118,7 @@ async function readHistory(
       let unsettled = false
       for (const message of result.data) {
         if (message.type === "location-switched") {
-          directory = directoryInWorktree(message)
-          // A return to this worktree starts a new attribution span.
-          if (!directory) edits.clear()
+          directory = message.location.directory
           continue
         }
         if (message.type !== "assistant" || !directory) continue
@@ -136,9 +137,7 @@ async function readHistory(
           const time = part.time.completed ?? message.time.completed
           if (time === undefined) continue
           for (const resource of writtenPaths(part)) {
-            const relative = path.relative(root, path.resolve(directory, resource))
-            const file = relative.split(path.sep).join("/")
-            if (!file || file === ".." || file.startsWith("../") || path.isAbsolute(relative)) continue
+            const file = serverPath(directory).resolve(directory, resource)
             if (time > (edits.get(file) ?? -Infinity)) edits.set(file, time)
           }
         }
@@ -202,6 +201,37 @@ function readAhead(root: string, branch: string, signal: AbortSignal) {
   })
 }
 
+/** Isolate read failures and limit concurrent server requests. */
+async function readBatch<T, R>(items: readonly T[], read: (item: T) => Promise<R>) {
+  const results: PromiseSettledResult<R>[] = []
+  for (let offset = 0; offset < items.length; offset += CONCURRENCY) {
+    results.push(...(await Promise.allSettled(items.slice(offset, offset + CONCURRENCY).map(read))))
+  }
+  return results
+}
+
+async function readWorktree(client: Plugin.Context["client"], root: string, local: boolean, lifetime: AbortSignal) {
+  const label = `📁 ${displayPath(root)}`
+  try {
+    const location = { directory: root }
+    const signal = AbortSignal.any([lifetime, AbortSignal.timeout(10_000)])
+    const { data: files } = await client.vcs.status({ location }, { signal })
+    if (!files.length) return { root, label, files }
+
+    const branchSignal = AbortSignal.any([lifetime, AbortSignal.timeout(3_000)])
+    const vcs = await client.vcs
+      .get({ location }, { signal: branchSignal })
+      .then(({ data }) => data, () => undefined)
+    const branch = vcs?.branch.current
+    const branchLabel = branch ?? (vcs?.provider === "git" ? "detached HEAD" : "branch unavailable")
+    const ahead =
+      vcs?.provider === "git" && !branch ? "-" : branch && local ? await readAhead(root, branch, branchSignal) : "?"
+    return { root, label: `${label} · ⑂ ${displayPath(branchLabel)} (${ahead})`, files }
+  } catch {
+    return { root, label, files: [], error: true }
+  }
+}
+
 function Sidebar(props: {
   context: Plugin.Context
   sessionID: string
@@ -212,10 +242,8 @@ function Sidebar(props: {
   setSessionsCollapsed: (sessionIDs: readonly string[], collapsed: boolean) => void
 }) {
   const { client, data, theme, ui } = props.context
-  const [files, setFiles] = createSignal<VcsFileStatus[]>([])
-  const [statusError, setStatusError] = createSignal(false)
-  const [worktreeStatus, setWorktreeStatus] = createSignal<string>()
-  const [attribution, setAttribution] = createSignal<{ sessions: Map<string, SessionChanges>; partial: boolean }>()
+  const [scan, setScan] = createSignal<SidebarScan>()
+  const [projectError, setProjectError] = createSignal(false)
   let scope: LocationGetOutput | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
   const lifetime = new AbortController()
@@ -228,87 +256,79 @@ function Sidebar(props: {
     return open.some((tab) => tab.sessionID === rootID) ? open : [...open, { sessionID: rootID, title: undefined }]
   })
 
-  async function refreshWorktreeStatus(root: string) {
-    const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(3_000)])
-    const vcs = await client.vcs
-      .get({ location: { directory: root } }, { signal })
-      .then(({ data }) => data, () => undefined)
-    const branch = vcs?.branch.current
-    let ahead = "?"
-    if (vcs?.provider === "git" && !branch) ahead = "-"
-    if (vcs?.provider === "git" && branch && local) ahead = await readAhead(root, branch, signal)
-    const worktree = serverPath(root).basename(root) || root
-    const branchLabel = branch ?? (vcs?.provider === "git" ? "detached HEAD" : "branch unavailable")
-    if (!lifetime.signal.aborted) setWorktreeStatus(`${displayPath(worktree)} · ${displayPath(branchLabel)} (${ahead})`)
-  }
-
   async function refresh() {
-    let root: string
-    try {
-      const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(10_000)])
-      scope ??= await client.location.get({ location: { directory: props.directory } }, { signal })
-      root = scope.project.directory
-      const { data } = await client.vcs.status({ location: { directory: root } }, { signal })
-      if (lifetime.signal.aborted) return
-      setStatusError(false)
-      setFiles(data)
-      if (!data.length) return
-    } catch {
-      if (lifetime.signal.aborted) return
-      setFiles([])
-      setStatusError(true)
-      return
-    }
-
-    const branchStatus = refreshWorktreeStatus(root)
     try {
       const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(15_000)])
+      scope ??= await client.location.get({ location: { directory: props.directory } }, { signal })
+      const project = scope.project
+      const activeRoot = project.directory
       const open = tabs()
       const candidates = open.slice(0, SESSION_LIMIT)
-      const next = new Map<string, SessionChanges>()
+      const activeID = data.session.root(props.sessionID)
+      const active = open.find((tab) => tab.sessionID === activeID)
+      if (active && !candidates.includes(active)) candidates[SESSION_LIMIT - 1] = active
+
+      // Use saved worktree paths to locate edits. Do not read Git status for unrelated checkouts.
+      const inventory = await client.worktree.list({ projectID: project.id }, { signal }).catch(() => undefined)
+      const knownRoots = [...new Set([activeRoot, ...(inventory?.map((tree) => tree.directory) ?? [])])]
+      const sessions = new Map<string, SessionChanges>()
       const updates: IndexUpdate[] = []
-      let partial = open.length > candidates.length
-      for (let offset = 0; offset < candidates.length; offset += CONCURRENCY) {
-        if (signal.aborted) {
-          partial = true
-          break
+      let partial = !inventory || open.length > candidates.length
+      const results = await readBatch(candidates, async ({ sessionID }): Promise<SessionChanges | undefined> => {
+        const session = await client.session.get({ sessionID }, { signal })
+        if (session.projectID !== project.id) return
+        let root = sessionRoot(session, knownRoots)
+        if (!root) {
+          const found = await client.location.get({ location: session.location }, { signal })
+          if (found.project.id !== project.id) return
+          root = found.project.directory
         }
-        const results = await Promise.allSettled(
-          candidates.slice(offset, offset + CONCURRENCY).map(async ({ sessionID }) => {
-            const session = await client.session.get({ sessionID }, { signal })
-            if (session.projectID !== scope?.project.id || !inWorktree(session, root)) return
-            const stored = props.editIndex[session.id]
-            // Storage can update while an API read is in flight.
-            const before = stored && structuredClone(unwrap(stored))
-            const history = await readHistory(client, session, root, before, signal)
-            if (before?.revision !== history.checkpoint?.revision) {
-              updates.push({ sessionID: session.id, expectedRevision: before?.revision, checkpoint: history.checkpoint })
-            }
-            return { session, history }
-          }),
-        )
-        for (const result of results) {
-          if (result.status === "rejected") {
-            partial = true
-            continue
-          }
-          const entry = result.value
-          if (!entry) continue
-          partial ||= entry.history.partial
-          next.set(entry.session.id, entry)
+        // Storage can update while an API read is in flight.
+        const stored = props.editIndex[session.id]
+        const before = stored && structuredClone(unwrap(stored))
+        const history = await readHistory(client, session, before, signal)
+        if (before?.revision !== history.checkpoint?.revision) {
+          updates.push({ sessionID: session.id, expectedRevision: before?.revision, checkpoint: history.checkpoint })
+        }
+        return { session, root, history }
+      })
+      for (const result of results) {
+        if (result.status === "rejected") {
+          partial = true
+          continue
+        }
+        const entry = result.value
+        if (!entry) continue
+        partial ||= entry.history.partial
+        sessions.set(entry.session.id, entry)
+      }
+
+      const selected = new Set([activeRoot])
+      for (const { root } of sessions.values()) selected.add(root)
+      const roots = [...new Set([...selected, ...knownRoots])].sort((a, b) => b.length - a.length)
+      for (const { history } of sessions.values()) {
+        for (const file of history.edits.keys()) {
+          const root = roots.find((root) => relativeFile(root, file))
+          if (root) selected.add(root)
         }
       }
+      partial ||= selected.size > WORKTREE_LIMIT
+      const statusSignal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(15_000)])
+      const statuses = await readBatch([...selected].slice(0, WORKTREE_LIMIT), (root) =>
+        readWorktree(client, root, local, statusSignal),
+      )
+      const worktrees = statuses.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []))
+      partial ||= statuses.length !== worktrees.length
       if (lifetime.signal.aborted) return
-      setAttribution({ sessions: next, partial })
+      setProjectError(false)
+      setScan({ worktrees, roots, sessions, partial })
       if (updates.length) {
         await props.saveIndex(updates).catch(() => {
-          if (!lifetime.signal.aborted) setAttribution({ sessions: next, partial: true })
+          if (!lifetime.signal.aborted) setScan({ worktrees, roots, sessions, partial: true })
         })
       }
     } catch {
-      if (!lifetime.signal.aborted) setAttribution({ sessions: new Map(), partial: true })
-    } finally {
-      await branchStatus
+      if (!lifetime.signal.aborted) setProjectError(true)
     }
   }
 
@@ -322,36 +342,51 @@ function Sidebar(props: {
     clearTimeout(timer)
   })
 
-  const groups = createMemo(() => {
+  const worktrees = createMemo(() => {
+    const result = scan()
+    if (!result) return []
     const open = tabs()
-    const records = attribution()?.sessions
-    const byTab = new Map<string | undefined, VcsFileStatus[]>()
-    for (const file of files()) {
-      let owner: string | undefined
-      let latest = -Infinity
-      for (const tab of open) {
-        const time = records?.get(tab.sessionID)?.history.edits.get(file.file)
-        if (time === undefined || time < latest) continue
-        // Do not pick an owner when two tabs report the same completion time.
-        owner = time === latest ? undefined : tab.sessionID
-        latest = time
+    // Keep paths from distinct worktrees separate, even if the file names match.
+    const owners = new Map<string, Map<string, { sessionID?: string; time: number }>>()
+    for (const tab of open) {
+      const entry = result.sessions.get(tab.sessionID)
+      if (!entry) continue
+      for (const [absolute, time] of entry.history.edits) {
+        const root = result.roots.find((root) => relativeFile(root, absolute))
+        const file = root && relativeFile(root, absolute)
+        if (!root || !file) continue
+        const files = owners.get(root) ?? new Map()
+        const previous = files.get(file)
+        if (!previous || time > previous.time) files.set(file, { sessionID: tab.sessionID, time })
+        else if (time === previous.time && previous.sessionID !== tab.sessionID) files.set(file, { time })
+        owners.set(root, files)
       }
-      const changes = byTab.get(owner) ?? []
-      changes.push(file)
-      byTab.set(owner, changes)
     }
-    const sessions = open.flatMap((tab) => {
-      const changes = byTab.get(tab.sessionID)
-      if (!changes) return []
-      const label = data.session.get(tab.sessionID)?.title ?? tab.title ?? records?.get(tab.sessionID)?.session.title
-      return [{ sessionID: tab.sessionID, label: label || tab.sessionID, files: changes }]
+
+    return result.worktrees.filter((tree) => tree.error || tree.files.length).map((tree) => {
+      const byTab = new Map<string | undefined, VcsFileStatus[]>()
+      for (const file of tree.files) {
+        const owner = owners.get(tree.root)?.get(file.file)?.sessionID
+        const changes = byTab.get(owner) ?? []
+        changes.push(file)
+        byTab.set(owner, changes)
+      }
+      const groups: { id?: string; label: string; files: VcsFileStatus[] }[] = open.flatMap((tab) => {
+        const files = byTab.get(tab.sessionID)
+        if (!files) return []
+        const label = data.session.get(tab.sessionID)?.title ?? tab.title ?? result.sessions.get(tab.sessionID)?.session.title
+        return [{ id: JSON.stringify([tree.root, tab.sessionID]), label: label || tab.sessionID, files }]
+      })
+      const unassigned = byTab.get(undefined)
+      if (unassigned) groups.push({ label: "Unassigned", files: unassigned })
+      return { ...tree, groups }
     })
-    const unknown = byTab.get(undefined)
-    const label = attribution() ? "Unassigned" : "Awaiting match"
-    return unknown ? [...sessions, { sessionID: undefined, label, files: unknown }] : sessions
   })
-  const sessionGroupIDs = createMemo(() => groups().flatMap(({ sessionID }) => (sessionID ? [sessionID] : [])))
-  const canToggleAll = () => !statusError() && sessionGroupIDs().length > 0
+  const count = createMemo(() => worktrees().reduce((total, tree) => total + tree.files.length, 0))
+  const sessionGroupIDs = createMemo(() =>
+    worktrees().flatMap((tree) => tree.groups.flatMap(({ id }) => (id ? [id] : []))),
+  )
+  const canToggleAll = () => !projectError() && sessionGroupIDs().length > 0
   const allCollapsed = () => sessionGroupIDs().every((sessionID) => props.collapsedSessions().has(sessionID))
   const allAction = () => (allCollapsed() ? "Expand all" : "Collapse all")
   const toggleAll = () => {
@@ -370,19 +405,14 @@ function Sidebar(props: {
       },
     ],
   }))
-  const matchStatus = () => {
-    const result = attribution()
-    if (!result) return "Matching sessions…"
-    return result.partial ? "Indexed file edits · partial history" : "Latest recorded file edits"
-  }
   const marker = { added: "A", deleted: "D", modified: "M" } as const
 
   return (
-    <Show when={statusError() || files().length > 0}>
+    <Show when={projectError() || worktrees().length > 0 || scan()?.partial}>
       <box>
         <box flexDirection="row" justifyContent="space-between" gap={1}>
           <text fg={theme.text.base} wrapMode="word" flexShrink={1} minWidth={0}>
-            <b>Git changes ({files().length})</b>
+            <b>Git changes ({count()})</b>
           </text>
           <Show when={canToggleAll()}>
             <text
@@ -400,106 +430,168 @@ function Sidebar(props: {
             </text>
           </Show>
         </box>
-        <Show
-          when={statusError()}
-          fallback={
-            <>
-              <text fg={theme.text.muted} wrapMode="word">
-                {matchStatus()}
-              </text>
-              <For each={groups()}>
-                {(group) => {
-                  const sessionID = group.sessionID
-                  const expanded = () => !sessionID || !props.collapsedSessions().has(sessionID)
-                  return (
-                    <box marginTop={1}>
-                      <text
-                        fg={theme.text.base}
-                        wrapMode="char"
-                        selectable={!sessionID}
-                        onMouseUp={
-                          sessionID
-                            ? (event) => {
-                                if (event.button !== MouseButton.LEFT || event.isDragging) return
-                                event.stopPropagation()
-                                props.setSessionsCollapsed([sessionID], expanded())
-                              }
-                            : undefined
-                        }
-                      >
-                        <b>
-                          {sessionID ? (expanded() ? "▼ " : "▶ ") : ""}
-                          {group.label}
-                        </b>
-                        <Show when={!expanded()}>
-                          <span style={{ fg: theme.text.muted }}> ({group.files.length})</span>
-                        </Show>
-                      </text>
-                      <Show when={sessionID && worktreeStatus()}>
-                        <text fg={theme.text.muted} wrapMode="word">
-                          {worktreeStatus()}
-                        </text>
-                      </Show>
-                      <Show when={expanded()}>
-                        <For each={group.files}>
-                          {(file) => (
-                            <box flexDirection="row" width="100%" gap={1}>
-                              <text
-                                fg="white"
-                                bg={props.context.themeMode === "light" ? "#303030" : undefined}
-                                width={3}
-                                height={1}
-                                flexShrink={0}
-                              >
-                                [{marker[file.status]}]
-                              </text>
-                              <text
-                                fg={theme.markdown.linkText}
-                                attributes={TextAttributes.UNDERLINE}
-                                wrapMode="char"
-                                flexGrow={1}
-                                flexShrink={1}
-                                minWidth={0}
-                                selectable={false}
-                                onMouseUp={(event) => {
+        <Show when={projectError()}>
+          <text fg={theme.text.feedback.error.base} wrapMode="word">
+            Could not read the project or its worktrees.
+          </text>
+        </Show>
+        <Show when={!projectError()}>
+          <text fg={theme.text.muted} wrapMode="word">
+            {scan()?.partial ? "Partial session or worktree results" : "Latest recorded file edits"}
+          </text>
+          <For each={worktrees()}>
+            {(tree) => (
+              <box marginTop={1}>
+                <text fg={theme.text.muted} wrapMode="char">
+                  <b>{tree.label}</b>
+                </text>
+                <Show when={tree.error}>
+                  <text fg={theme.text.feedback.error.base}>Could not read Git status.</text>
+                </Show>
+                <For each={tree.groups}>
+                  {(group) => {
+                    const id = group.id
+                    const expanded = () => !id || !props.collapsedSessions().has(id)
+                    return (
+                      <box>
+                        <text
+                          fg={theme.text.base}
+                          wrapMode="char"
+                          selectable={!id}
+                          onMouseUp={
+                            id
+                              ? (event) => {
                                   if (event.button !== MouseButton.LEFT || event.isDragging) return
                                   event.stopPropagation()
-                                  const sessionID = props.sessionID
-                                  // OpenCode 2.3.2 accepts a diff source here, but no initial file.
-                                  ui.router.navigate({
-                                    type: "plugin",
-                                    id: "opencode.diffs",
-                                    name: "diff",
-                                    data: { mode: "working", sessionID, returnRoute: { type: "session", sessionID } },
-                                  })
-                                }}
-                              >
-                                {displayPath(file.file)}
-                              </text>
-                            </box>
-                          )}
-                        </For>
-                      </Show>
-                    </box>
-                  )
-                }}
-              </For>
-            </>
-          }
-        >
-          <text fg={theme.text.feedback.error.base} wrapMode="word">
-            Could not read Git status.
-          </text>
+                                  props.setSessionsCollapsed([id], expanded())
+                                }
+                              : undefined
+                          }
+                        >
+                          <b>
+                            {id ? (expanded() ? "▼ " : "▶ ") : ""}
+                            {group.label}
+                          </b>
+                          <Show when={!expanded()}>
+                            <span style={{ fg: theme.text.muted }}> ({group.files.length})</span>
+                          </Show>
+                        </text>
+                        <Show when={expanded()}>
+                          <For each={group.files}>
+                            {(file) => (
+                              <box flexDirection="row" width="100%" gap={1}>
+                                <text
+                                  fg="white"
+                                  bg={props.context.themeMode === "light" ? "#303030" : undefined}
+                                  width={3}
+                                  height={1}
+                                  flexShrink={0}
+                                >
+                                  [{marker[file.status]}]
+                                </text>
+                                <text
+                                  fg={theme.markdown.linkText}
+                                  attributes={TextAttributes.UNDERLINE}
+                                  wrapMode="char"
+                                  flexGrow={1}
+                                  flexShrink={1}
+                                  minWidth={0}
+                                  selectable={false}
+                                  onMouseUp={(event) => {
+                                    if (event.button !== MouseButton.LEFT || event.isDragging) return
+                                    event.stopPropagation()
+                                    const link: FileLink = { root: tree.root, file: file.file, sessionID: props.sessionID }
+                                    ui.router.navigate({ type: "plugin", name: "file-diff", data: link })
+                                  }}
+                                >
+                                  {displayPath(file.file)}
+                                </text>
+                              </box>
+                            )}
+                          </For>
+                        </Show>
+                      </box>
+                    )
+                  }}
+                </For>
+              </box>
+            )}
+          </For>
         </Show>
       </box>
     </Show>
   )
 }
 
+/** Open the selected file in its worktree without changing the session's location. */
+function FileDiff(props: { context: Plugin.Context; link: FileLink }) {
+  const { client, keymap, theme, ui } = props.context
+  const { root, file, sessionID } = props.link
+  const lifetime = new AbortController()
+  const [diff, { refetch }] = createResource(async () => {
+    const signal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(15_000)])
+    try {
+      const { data } = await client.vcs.diff({ location: { directory: root }, mode: "working", context: 3 }, { signal })
+      return { file: data.find((entry) => entry.file === file) }
+    } catch {
+      return { error: true }
+    }
+  })
+  const close = () => ui.router.navigate({ type: "session", sessionID })
+  onCleanup(() => lifetime.abort())
+  keymap.layer(() => ({
+    mode: "global",
+    priority: 100,
+    commands: [
+      { bind: "escape", run: close },
+      {
+        bind: "r",
+        run: () => {
+          if (!diff.loading) void refetch()
+        },
+      },
+    ],
+  }))
+  return (
+    <box flexDirection="column" flexGrow={1} minHeight={0} paddingLeft={1} paddingRight={1}>
+      <box flexShrink={0} paddingTop={1} paddingBottom={1}>
+        <text fg={theme.text.base} wrapMode="char">
+          <b>{displayPath(file)}</b>
+        </text>
+        <text fg={theme.text.muted} wrapMode="char">{displayPath(root)} · Uncommitted</text>
+      </box>
+      <Switch>
+        <Match when={diff.loading}>
+          <text fg={theme.text.muted}>Loading diff…</text>
+        </Match>
+        <Match when={diff()?.error}>
+          <text fg={theme.text.feedback.error.base}>Could not read the diff. Press r to retry.</text>
+        </Match>
+        <Match when={diff()?.file?.patch}>
+          {(patch) => (
+            <scrollbox flexGrow={1} minHeight={0} focused>
+              <text fg={theme.text.base} wrapMode="char">{patch()}</text>
+            </scrollbox>
+          )}
+        </Match>
+        <Match when={diff()?.file}>
+          <text fg={theme.text.muted}>This file has no text patch.</text>
+        </Match>
+        <Match when={diff.state === "ready"}>
+          <text fg={theme.text.muted}>This file no longer has an uncommitted diff in this worktree.</text>
+        </Match>
+      </Switch>
+      <text fg={theme.text.muted} flexShrink={0} paddingTop={1}>
+        Esc back · r reload
+      </text>
+    </box>
+  )
+}
+
 export default Plugin.define({
   id: "sidebar-git-diff",
   setup(context) {
-    const [editIndex, updateIndex] = context.storage.store<EditIndex>("edit-index-v1", { initial: {} })
+    const [editIndex, updateIndex] = context.storage.store<EditIndex>("edit-index-v2", { initial: {} })
     const saveIndex = (updates: IndexUpdate[]) =>
       updateIndex((draft) => {
         for (const { sessionID, expectedRevision, checkpoint } of updates) {
@@ -520,7 +612,14 @@ export default Plugin.define({
         return next
       })
     }
-    return context.ui.slot({
+    const unregisterDiff = context.ui.router.register({
+      name: "file-diff",
+      render: ({ data }) =>
+        typeof data?.root === "string" && typeof data.file === "string" && typeof data.sessionID === "string"
+          ? <FileDiff context={context} link={{ root: data.root, file: data.file, sessionID: data.sessionID }} />
+          : <text>Missing file or worktree.</text>,
+    })
+    const unregisterSidebar = context.ui.slot({
       append: "sidebar.content",
       render: (input) => (
         <Show keyed when={context.data.session.get(input.sessionID)?.location.directory}>
@@ -538,5 +637,9 @@ export default Plugin.define({
         </Show>
       ),
     })
+    return () => {
+      unregisterSidebar()
+      unregisterDiff()
+    }
   },
 })
